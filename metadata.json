@@ -1,0 +1,6 @@
+{
+  "name": "Supabase Admin Dashboard",
+  "description": "A modern, responsive admin dashboard to manage a 'subscriptions' table in a Supabase project. It allows for creating, viewing, updating, and deleting records with a clean and intuitive interface.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
