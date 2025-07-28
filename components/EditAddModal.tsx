@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
+import { User } from '@supabase/supabase-js';
 import { XMarkIcon } from './Icons';
 
 interface EditAddModalProps {
@@ -10,13 +11,16 @@ interface EditAddModalProps {
   initialData: any | null;
   columns: string[];
   tableName: string;
+  allUsers: User[];
 }
 
-// Columns to ignore in the form (system-generated or foreign keys)
-const IGNORED_COLUMNS = ['id', 'inserted_at', 'updated_at', 'user_id', 'created_at'];
+// Columns to ignore in the form (system-generated)
+const IGNORED_COLUMNS = ['id', 'inserted_at', 'updated_at', 'created_at'];
+// Tables that have a `user_id` field and a relationship to `auth.users`
+const tablesWithUsers = ['subscriptions', 'referral_usage', 'user_progress'];
 
 // Options for dropdowns in the subscriptions table
-const planOptions = ['free', 'basic', 'pro', 'enterprise'];
+const planOptions = ['bronze', 'silver'];
 const statusOptions = ['active', 'trialing', 'past_due', 'canceled', 'unpaid'];
 
 const EditAddModal: React.FC<EditAddModalProps> = ({
@@ -27,6 +31,7 @@ const EditAddModal: React.FC<EditAddModalProps> = ({
   initialData,
   columns,
   tableName,
+  allUsers,
 }) => {
   const [formData, setFormData] = useState<any>({});
   const [isSaving, setIsSaving] = useState(false);
@@ -34,18 +39,33 @@ const EditAddModal: React.FC<EditAddModalProps> = ({
   const formColumns = columns.filter(col => !IGNORED_COLUMNS.includes(col));
 
   useEffect(() => {
-    if (mode === 'edit' && initialData) {
-      // Populate form with existing data for editing
-      const filteredData = Object.fromEntries(
-        formColumns.map(col => [col, initialData[col] ?? ''])
-      );
-      setFormData(filteredData);
-    } else {
-      // Reset form for adding
-      const emptyData = Object.fromEntries(formColumns.map(col => [col, '']));
-      setFormData(emptyData);
+    if (isOpen) {
+      if (mode === 'edit' && initialData) {
+        const editFormData = {};
+        for (const col of formColumns) {
+          const value = initialData[col];
+          // For JSON fields, stringify the object for editing in a textarea
+          if (tableName === 'referral_usage' && col === 'details' && typeof value === 'object' && value !== null) {
+            editFormData[col] = JSON.stringify(value, null, 2);
+          } else {
+            editFormData[col] = value ?? '';
+          }
+        }
+        setFormData(editFormData);
+      } else { // Handles 'add' mode
+        // Start with a blank slate based on columns
+        const emptyData = Object.fromEntries(formColumns.map(col => [col, '']));
+        // Merge any pre-filled data from `initialData` (e.g., user_id)
+        const finalData = { ...emptyData, ...(initialData || {}) };
+
+        // Provide a helpful starting template for the details JSON field
+        if (tableName === 'referral_usage' && formColumns.includes('details') && !finalData.details) {
+          finalData['details'] = '{\n  "source": "manual_entry"\n}';
+        }
+        setFormData(finalData);
+      }
     }
-  }, [isOpen, mode, initialData, columns]);
+  }, [isOpen, mode, initialData, columns, tableName]);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
     const { name, value, type } = e.target;
@@ -62,7 +82,9 @@ const EditAddModal: React.FC<EditAddModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSaving(true);
-    await onSave(formData);
+    // Create a clean copy of formData, excluding the 'users' object that might exist from initialData
+    const { users, ...payload } = formData;
+    await onSave(payload);
     setIsSaving(false);
   };
 
@@ -80,7 +102,7 @@ const EditAddModal: React.FC<EditAddModalProps> = ({
           <div className="p-6">
             <div className="flex justify-between items-center">
                 <h2 id="modal-title" className="text-xl font-bold capitalize">
-                    {mode === 'add' ? 'Add New Row to' : 'Edit Row in'} {tableName}
+                    {mode === 'add' ? 'Add New Row to' : 'Edit Row in'} {tableName.replace(/_/g, ' ')}
                 </h2>
                 <button type="button" onClick={onClose} className="p-1 rounded-full text-slate-400 hover:bg-slate-700 hover:text-white transition">
                     <XMarkIcon className="w-6 h-6"/>
@@ -91,6 +113,49 @@ const EditAddModal: React.FC<EditAddModalProps> = ({
           <div className="px-6 py-4 border-y border-slate-700 max-h-[60vh] overflow-y-auto">
             <div className="space-y-4">
               {formColumns.map(col => {
+                // Special handling for user_id to show a dropdown
+                if (tablesWithUsers.includes(tableName) && col === 'user_id' && allUsers.length > 0) {
+                  return (
+                    <div key={col}>
+                      <label htmlFor={col} className="block text-sm font-medium text-slate-300 mb-1">User</label>
+                      <select
+                        id={col}
+                        name={col}
+                        value={formData[col] || ''}
+                        onChange={handleChange}
+                        className="w-full bg-slate-700 text-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500 transition duration-200"
+                      >
+                        <option value="" disabled>Select a user...</option>
+                        {allUsers.map(user => (
+                          <option key={user.id} value={user.id}>
+                            {user.email || user.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  );
+                }
+
+                // Special handling for the 'details' JSON field in the referral_usage table
+                if (tableName === 'referral_usage' && col === 'details') {
+                  return (
+                    <div key={col}>
+                      <label htmlFor={col} className="block text-sm font-medium text-slate-300 capitalize mb-1">
+                        Details (JSON)
+                      </label>
+                      <textarea
+                        id={col}
+                        name={col}
+                        value={formData[col] || ''}
+                        onChange={handleChange}
+                        rows={6}
+                        className="w-full bg-slate-900 text-slate-200 placeholder-slate-500 rounded-md px-3 py-2 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-sky-500 transition duration-200"
+                        placeholder='e.g., { "source": "campaign_x", "value": 50 }'
+                      />
+                    </div>
+                  );
+                }
+
                 // Special handling for dropdowns in subscriptions table
                 if (tableName === 'subscriptions') {
                   if (col === 'plan') {

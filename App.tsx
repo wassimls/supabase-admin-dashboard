@@ -9,8 +9,10 @@ import UserManagementModal from './components/UserManagementModal';
 import AddUserModal from './components/AddUserModal';
 import Toast from './components/Toast';
 
-// Define the type for public table names from the database schema
-type PublicTableName = keyof Database['public']['Tables'];
+// Define the type for public table names from the database schema.
+// By defining this as a literal union type, we avoid overly complex type inference
+// that was causing "Type instantiation is excessively deep" errors.
+type PublicTableName = 'subscriptions' | 'referral_usage' | 'user_progress';
 
 // Define a type for our managed tables to ensure schema is correctly typed
 type ManagedTable = {
@@ -28,40 +30,36 @@ const managedTables: ManagedTable[] = [
   { schema: 'auth', name: 'users', icon: <UsersIcon className="w-5 h-5" /> },
 ];
 
-// Helper to format Supabase errors into a readable string
+// Tables that have a `user_id` field and a relationship to `auth.users`
+const tablesWithUsers = ['subscriptions', 'referral_usage', 'user_progress'];
+
+// A more robust helper to format Supabase errors into a readable string.
 const formatSupabaseError = (error: any): string => {
     if (!error) return 'An unknown error occurred.';
+    if (typeof error === 'string') return error;
 
-    // Check for Supabase error structure (which has a `message` property)
-    if (typeof error === 'object' && error !== null && 'message' in error) {
-        let message = String(error.message);
-
-        if ('details' in error && typeof error.details === 'string' && error.details) {
-            message += ` (${error.details})`;
-        }
-        
-        if (message.includes('failed to fetch')) {
-            return 'Network error: Failed to connect to Supabase. Please check your network connection and Supabase URL.';
-        }
-        
-        // Provide more user-friendly messages for common issues
-        if (message.includes('JWT')) {
-            return 'Authentication error: Invalid Supabase key (JWT). Please check your credentials.';
-        }
-        if (message.includes('relation') && message.includes('does not exist')) {
-             return `Database schema error: A required table was not found. Details: ${message}`;
-        }
-
-        return message;
-    }
-
-    // Handle standard JavaScript Error objects
-    if (error instanceof Error) {
+    // Standard JS Error object and most Supabase errors have a `message` property.
+    if (error.message && typeof error.message === 'string' && error.message.trim()) {
         return error.message;
     }
 
-    // Fallback for other types
-    return 'An unknown error occurred. Check the browser console for more details.';
+    // For other cases (like some Auth errors), stringify the object.
+    try {
+        const jsonString = JSON.stringify(error);
+        if (jsonString !== '{}') {
+            return jsonString;
+        }
+    } catch (e) {
+        // Fall through if stringify fails (e.g., circular references)
+    }
+    
+    // Last resort to avoid '[object Object]'
+    const fallbackString = String(error);
+    if (fallbackString !== '[object Object]') {
+        return fallbackString;
+    }
+
+    return 'An unknown error occurred. Check the developer console for details.';
 };
 
 
@@ -71,6 +69,7 @@ const App: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [headers, setHeaders] = useState<string[]>([]);
+  const [allUsers, setAllUsers] = useState<User[]>([]);
 
   // CRUD Modals state
   const [isEditAddModalOpen, setIsEditAddModalOpen] = useState(false);
@@ -88,61 +87,152 @@ const App: React.FC = () => {
   
   const isUsersTable = selectedTable.schema === 'auth' && selectedTable.name === 'users';
 
+  const fetchAllUsers = useCallback(async () => {
+    const client = createClient<Database>(supabaseUrl, supabaseKey);
+    let allFetchedUsers: User[] = [];
+    let page = 1;
+
+    try {
+      while (true) { // Loop until no more users are returned
+        const { data: usersData, error: usersError } = await client.auth.admin.listUsers({
+          page,
+          perPage: 100, // Fetch in batches of 100
+        });
+
+        if (usersError) {
+          console.error(`Error fetching page ${page} of users:`, usersError);
+          // Stop fetching if an error occurs, but still use what we've got
+          break;
+        }
+
+        if (usersData && usersData.users.length > 0) {
+          allFetchedUsers.push(...usersData.users);
+          page++;
+        } else {
+          // No more users to fetch, exit the loop
+          break;
+        }
+      }
+      setAllUsers(allFetchedUsers);
+    } catch (err) {
+      console.error("Failed to fetch all users:", err);
+    }
+  }, []);
+
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError(null);
     setData([]);
     setHeaders([]);
     
-    const client = createClient(supabaseUrl, supabaseKey);
-
     try {
-      let tableData: any[] | null = [];
-      let tableError: any = null;
-
+      const client = createClient<Database>(supabaseUrl, supabaseKey);
+      
       if (isUsersTable) {
-        // Use the dedicated admin function to list users securely
-        const { data: usersData, error: usersError } = await client.auth.admin.listUsers({
-          page: 1,
-          perPage: 100,
-        });
-        tableData = usersData?.users || [];
-        tableError = usersError;
+        // `allUsers` state is the single source of truth for the users table.
+        setData(allUsers);
+        if (allUsers.length > 0) {
+            setHeaders(Object.keys(allUsers[0]));
+        }
+      } else if (selectedTable.name === 'subscriptions' || selectedTable.name === 'user_progress') {
+          const tableName = selectedTable.name;
+          const { data: tableData, error: tableError } = await client
+              .from(tableName)
+              .select('*');
+
+          if (tableError) throw tableError;
+
+          const dataByUser = new Map<string, any[]>();
+          if (tableData) {
+              for (const record of tableData) {
+                  if (!dataByUser.has(record.user_id)) {
+                      dataByUser.set(record.user_id, []);
+                  }
+                  dataByUser.get(record.user_id)!.push(record);
+              }
+          }
+
+          const schemaHeaders: { [key: string]: string[] } = {
+              subscriptions: ['id', 'user_id', 'plan', 'status', 'start_date', 'end_date', 'created_at'],
+              user_progress: ['id', 'user_id', 'course_id', 'lesson_id', 'progress_percentage', 'completed_at', 'created_at', 'updated_at'],
+          };
+          
+          const actualHeaders = tableData && tableData.length > 0
+              ? Object.keys(tableData[0])
+              : schemaHeaders[tableName] || [];
+          setHeaders(actualHeaders);
+
+          const displayData: any[] = [];
+          for (const user of allUsers) {
+              const userRecords = dataByUser.get(user.id);
+              if (userRecords && userRecords.length > 0) {
+                  displayData.push(...userRecords);
+              } else {
+                  const placeholderRow: any = { user_id: user.id, id: null };
+                  for (const header of actualHeaders) {
+                      if (header !== 'user_id') placeholderRow[header] = null;
+                  }
+                  displayData.push(placeholderRow);
+              }
+          }
+          
+          const userEmailMap = new Map(allUsers.map(u => [u.id, u.email || '']));
+          displayData.sort((a, b) => {
+              const emailA = userEmailMap.get(a.user_id) || '';
+              const emailB = userEmailMap.get(b.user_id) || '';
+              if (emailA < emailB) return -1;
+              if (emailA > emailB) return 1;
+              if (a.id && b.id) return a.id - b.id;
+              if (a.id) return -1;
+              if (b.id) return 1;
+              return 0;
+          });
+
+          setData(displayData);
       } else {
-        // Use standard query for all other public tables
         const { data: standardData, error: standardError } = await client
-          .from(selectedTable.name)
+          .from(selectedTable.name as PublicTableName)
           .select('*')
-          .limit(100)
           .order('id', { ascending: false });
-        tableData = standardData;
-        tableError = standardError;
-      }
+        
+        if (standardError) throw standardError;
       
-      if (tableError) throw tableError;
-      
-      if (tableData && tableData.length > 0) {
-        setHeaders(Object.keys(tableData[0]));
-        setData(tableData);
-      } else {
-        setData([]); // Ensure data is an empty array if no results
+        if (standardData && standardData.length > 0) {
+          const keys = Object.keys(standardData[0]);
+          setHeaders(keys);
+          setData(standardData);
+        } else {
+          setData([]);
+          setHeaders([]);
+        }
       }
     } catch (err: any) {
+      const errorMessage = formatSupabaseError(err);
       console.error(`Error fetching ${selectedTable.schema}.${selectedTable.name}:`, err);
-      setError(`Error fetching data: ${formatSupabaseError(err)}`);
+      setError(`Error fetching data: ${errorMessage}`);
     } finally {
       setLoading(false);
     }
-  }, [selectedTable, isUsersTable]);
+  }, [selectedTable, isUsersTable, allUsers]);
 
   useEffect(() => {
     fetchData();
   }, [fetchData]);
 
+  useEffect(() => {
+    fetchAllUsers();
+  }, [fetchAllUsers]);
+
   // Handlers for standard tables
   const handleAddNew = () => {
     setModalMode('add');
     setCurrentRow(null);
+    setIsEditAddModalOpen(true);
+  };
+  
+  const handleAddNewRecordForUser = (userId: string) => {
+    setModalMode('add');
+    setCurrentRow({ user_id: userId });
     setIsEditAddModalOpen(true);
   };
 
@@ -156,10 +246,10 @@ const App: React.FC = () => {
     if (window.confirm(`Are you sure you want to delete this row? (ID: ${row.id})`)) {
       setLoading(true);
       try {
-        const client = createClient(supabaseUrl, supabaseKey);
+        const client = createClient<Database>(supabaseUrl, supabaseKey);
 
         const { error: deleteError } = await client
-          .from(selectedTable.name)
+          .from(selectedTable.name as PublicTableName)
           .delete()
           .eq('id', row.id);
         
@@ -179,52 +269,64 @@ const App: React.FC = () => {
   const handleSave = async (formData: any) => {
     setLoading(true);
     try {
-        const client = createClient(supabaseUrl, supabaseKey);
-        let error: any;
+        const client = createClient<Database>(supabaseUrl, supabaseKey);
+        let postgrestError: any;
 
         if (isUsersTable) {
             throw new Error("Save operation is not permitted for users table.");
         }
         
         const tableName = selectedTable.name as PublicTableName;
+        const dataToSave = { ...formData };
 
-        // Use a switch on the table name to provide type safety for Supabase operations
-        switch (tableName) {
-            case 'subscriptions':
+        switch(tableName) {
+            case 'subscriptions': {
                 if (modalMode === 'add') {
-                    const { error: insertError } = await client.from('subscriptions').insert([formData]);
-                    error = insertError;
+                    const { error } = await client.from('subscriptions').insert([dataToSave]);
+                    postgrestError = error;
                 } else {
-                    const { error: updateError } = await client.from('subscriptions').update(formData).eq('id', currentRow.id);
-                    error = updateError;
+                    const { error } = await client.from('subscriptions').update(dataToSave).eq('id', currentRow.id);
+                    postgrestError = error;
                 }
                 break;
-            case 'referral_usage':
-                 if (modalMode === 'add') {
-                    const { error: insertError } = await client.from('referral_usage').insert([formData]);
-                    error = insertError;
+            }
+            case 'referral_usage': {
+                if (dataToSave.details && typeof dataToSave.details === 'string') {
+                    try { dataToSave.details = JSON.parse(dataToSave.details); } catch (e) {
+                        console.error("Invalid JSON in details field", e);
+                    }
+                }
+                if (modalMode === 'add') {
+                    const { error } = await client.from('referral_usage').insert([dataToSave]);
+                    postgrestError = error;
                 } else {
-                    const { error: updateError } = await client.from('referral_usage').update(formData).eq('id', currentRow.id);
-                    error = updateError;
+                    const { error } = await client.from('referral_usage').update(dataToSave).eq('id', currentRow.id);
+                    postgrestError = error;
                 }
                 break;
-            case 'user_progress':
-                 if (modalMode === 'add') {
-                    const { error: insertError } = await client.from('user_progress').insert([formData]);
-                    error = insertError;
+            }
+            case 'user_progress': {
+                if (dataToSave.progress_percentage != null && dataToSave.progress_percentage !== '') {
+                    dataToSave.progress_percentage = Number(dataToSave.progress_percentage);
+                } else if (dataToSave.progress_percentage === '') {
+                    delete dataToSave.progress_percentage;
+                }
+                if (modalMode === 'add') {
+                    const { error } = await client.from('user_progress').insert([dataToSave]);
+                    postgrestError = error;
                 } else {
-                    const { error: updateError } = await client.from('user_progress').update(formData).eq('id', currentRow.id);
-                    error = updateError;
+                    const { error } = await client.from('user_progress').update(dataToSave).eq('id', currentRow.id);
+                    postgrestError = error;
                 }
                 break;
+            }
             default: {
-                // This ensures that if we add a new table to PublicTableName, we must handle it here.
                 const exhaustiveCheck: never = tableName;
                 throw new Error(`Unhandled table: ${exhaustiveCheck}`);
             }
         }
         
-        if (error) throw error;
+        if (postgrestError) throw postgrestError;
         
         showToast(`Row ${modalMode === 'add' ? 'added' : 'updated'} successfully!`, 'success');
         setIsEditAddModalOpen(false);
@@ -244,7 +346,7 @@ const App: React.FC = () => {
 
   const handleCreateUser = async (userData: { email: string; password: string; metadata: object; }): Promise<string | null> => {
     try {
-      const client = createClient(supabaseUrl, supabaseKey);
+      const client = createClient<Database>(supabaseUrl, supabaseKey);
       const { error } = await client.auth.admin.createUser({
         email: userData.email,
         password: userData.password,
@@ -256,7 +358,7 @@ const App: React.FC = () => {
       
       showToast('User created successfully!', 'success');
       setIsAddUserModalOpen(false);
-      await fetchData(); // Refresh user list, this will manage the loading state of the table
+      await fetchAllUsers(); // Refresh the master user list
       return null; // Indicates success
     } catch (err: any) {
       console.error('Error creating user:', err);
@@ -274,14 +376,14 @@ const App: React.FC = () => {
   const handleUpdateUser = async (userId: string, metadata: object) => {
     setLoading(true);
     try {
-      const client = createClient(supabaseUrl, supabaseKey);
+      const client = createClient<Database>(supabaseUrl, supabaseKey);
       const { error } = await client.auth.admin.updateUserById(userId, {
         user_metadata: metadata,
       });
       if (error) throw error;
       showToast('User metadata updated successfully!', 'success');
       setIsUserModalOpen(false);
-      await fetchData();
+      await fetchAllUsers(); // Refresh the master user list
     } catch (err: any) {
       console.error('Error updating user:', err);
       showToast(`Error: ${formatSupabaseError(err)}`, 'error');
@@ -293,12 +395,12 @@ const App: React.FC = () => {
   const handleDeleteUser = async (userId: string) => {
     setLoading(true);
     try {
-      const client = createClient(supabaseUrl, supabaseKey);
+      const client = createClient<Database>(supabaseUrl, supabaseKey);
       const { error } = await client.auth.admin.deleteUser(userId);
       if (error) throw error;
       showToast('User deleted successfully!', 'success');
       setIsUserModalOpen(false);
-      await fetchData();
+      await fetchAllUsers(); // Refresh the master user list
     } catch (err: any) {
       console.error('Error deleting user:', err);
       showToast(`Error: ${formatSupabaseError(err)}`, 'error');
@@ -307,7 +409,18 @@ const App: React.FC = () => {
     }
   };
 
-  const renderCell = (item: any) => {
+  const renderCell = (item: any, header: string, row: any) => {
+    // Perform a client-side "join" to display user email instead of just the UUID.
+    if (header === 'user_id' && tablesWithUsers.includes(selectedTable.name as string)) {
+        const user = allUsers.find(u => u.id === item);
+        return (
+            <div>
+                <span className="font-semibold text-sky-400">{user?.email || 'N/A'}</span>
+                <div className="text-slate-500 text-xs font-mono mt-1">{item || ''}</div>
+            </div>
+        );
+    }
+
     if (item === null) return <span className="text-slate-500 italic">null</span>;
     if (typeof item === 'boolean') return <span className="font-mono">{item ? 'true' : 'false'}</span>;
     if (typeof item === 'object') {
@@ -392,9 +505,13 @@ const App: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody className="bg-slate-800 divide-y divide-slate-700">
-                    {data.map((row, rowIndex) => (
-                      <tr key={row.id || rowIndex} className="hover:bg-slate-700/50 transition-colors duration-150">
-                        {headers.map(header => <td key={`${row.id || rowIndex}-${header}`} className="px-6 py-4 whitespace-nowrap text-sm text-slate-200">{renderCell(row[header])}</td>)}
+                    {data.map((row) => {
+                      const isPlaceholderRow = !row.id;
+                      const isAllUserTableView = ['subscriptions', 'user_progress'].includes(selectedTable.name);
+                      
+                      return (
+                      <tr key={row.id || `user-placeholder-${row.user_id}`} className="hover:bg-slate-700/50 transition-colors duration-150">
+                        {headers.map(header => <td key={`${row.id || row.user_id}-${header}`} className="px-6 py-4 whitespace-nowrap text-sm text-slate-200">{renderCell(row[header], header, row)}</td>)}
                         <td className="px-6 py-4 whitespace-nowrap text-sm">
                             <div className="flex items-center gap-2">
                                 {isUsersTable ? (
@@ -403,14 +520,24 @@ const App: React.FC = () => {
                                     </button>
                                 ) : (
                                     <>
-                                        <button onClick={() => handleEdit(row)} className="p-2 rounded-full text-slate-400 hover:bg-slate-600 hover:text-sky-400 transition-colors" title="Edit Row"><PencilIcon className="w-4 h-4" /></button>
-                                        <button onClick={() => handleDelete(row)} className="p-2 rounded-full text-slate-400 hover:bg-slate-600 hover:text-red-400 transition-colors" title="Delete Row"><TrashIcon className="w-4 h-4" /></button>
+                                        {isAllUserTableView && isPlaceholderRow ? (
+                                             <button onClick={() => handleAddNewRecordForUser(row.user_id)} className="flex items-center gap-1 text-xs bg-sky-800 hover:bg-sky-700 text-white font-semibold px-2 py-1 rounded-md transition duration-200">
+                                                <PlusIcon className="w-4 h-4"/>
+                                                {selectedTable.name === 'subscriptions' ? 'Add Subscription' : 'Add Progress'}
+                                            </button>
+                                        ) : (
+                                            <>
+                                                <button onClick={() => handleEdit(row)} className="p-2 rounded-full text-slate-400 hover:bg-slate-600 hover:text-sky-400 transition-colors" title="Edit Row"><PencilIcon className="w-4 h-4" /></button>
+                                                <button onClick={() => handleDelete(row)} className="p-2 rounded-full text-slate-400 hover:bg-slate-600 hover:text-red-400 transition-colors" title="Delete Row"><TrashIcon className="w-4 h-4" /></button>
+                                            </>
+                                        )}
                                     </>
                                 )}
                             </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -428,6 +555,7 @@ const App: React.FC = () => {
           initialData={currentRow}
           columns={headers}
           tableName={selectedTable.name}
+          allUsers={allUsers}
         />
       )}
       

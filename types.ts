@@ -1,11 +1,4 @@
-
-export type Json =
-  | string
-  | number
-  | boolean
-  | null
-  | { [key: string]: Json | undefined }
-  | Json[]
+export type Json = any;
 
 export type Database = {
   public: {
@@ -38,15 +31,6 @@ export type Database = {
           end_date?: string | null
           created_at?: string
         }
-        Relationships: [
-          {
-            foreignKeyName: "subscriptions_user_id_fkey"
-            columns: ["user_id"]
-            isOneToOne: false
-            referencedRelation: "users"
-            referencedColumns: ["id"]
-          }
-        ]
       }
       referral_usage: {
         Row: {
@@ -70,15 +54,6 @@ export type Database = {
           used_at?: string
           details?: Json | null
         }
-        Relationships: [
-          {
-            foreignKeyName: "referral_usage_user_id_fkey"
-            columns: ["user_id"]
-            isOneToOne: false
-            referencedRelation: "users"
-            referencedColumns: ["id"]
-          }
-        ]
       }
       user_progress: {
         Row: {
@@ -111,15 +86,6 @@ export type Database = {
           created_at?: string
           updated_at?: string
         }
-        Relationships: [
-          {
-            foreignKeyName: "user_progress_user_id_fkey"
-            columns: ["user_id"]
-            isOneToOne: false
-            referencedRelation: "users"
-            referencedColumns: ["id"]
-          }
-        ]
       }
     }
     Views: {
